@@ -89,6 +89,9 @@ private:
     std::atomic<bool> work_todo;
 	uint64_t max_level = 0;
 
+    bool single_threaded_mode = false;
+    std::ofstream *main_thread_writer = nullptr;
+
 	uint64_t index_core(size_t a_size) {
         std::error_code error;
         mio::mmap_sink buf = mio::make_mmap_sink(
@@ -123,9 +126,11 @@ public:
     class iterator;
     class const_iterator;
     
-    iitree(const std::string& f) : filename(f) {
+    iitree(const std::string& f, const bool single_threaded_mode) : filename(f), single_threaded_mode(single_threaded_mode) {
         work_todo.store(false);
     }
+
+    iitree(const std::string& f) : iitree(f, false) {}
 
     ~iitree(void) {
         close_writer();
@@ -164,18 +169,28 @@ public:
     void open_writer(void) {
         if (!work_todo.load()) {
             work_todo.store(true);
-            writer_thread = std::thread(&iitree::writer_func, this);
+            if (!single_threaded_mode) {
+                writer_thread = std::thread(&iitree::writer_func, this);
+            } else {
+                main_thread_writer = new std::ofstream(filename.c_str(), std::ios::binary | std::ios::trunc);
+            }
         }
     }
 
     void close_writer(void) {
         if (work_todo.load()) {
             work_todo.store(false);
-            while (!interval_queue.was_empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            if (writer_thread.joinable()) {
-                writer_thread.join();
+            if (!single_threaded_mode) {
+                while (!interval_queue.was_empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (writer_thread.joinable()) {
+                    writer_thread.join();
+                }
+            } else {
+                main_thread_writer->close();
+                delete main_thread_writer;
+                main_thread_writer = nullptr;
             }
         }
     }
@@ -383,6 +398,13 @@ public:
     /// open_writer() must be called first to set up our buffer and writer
 	void add(const S &s, const S &e, const T &d) {
         interval_queue.push(make_interval(s, e, d));
+        // when in single-threaded-mode write value in main thread
+        if (single_threaded_mode) {
+            Interval ival;
+            while (interval_queue.try_pop(ival)) {
+                main_thread_writer->write((char*)&ival, sizeof(Interval));
+            }
+        }
     }
 
 	void index(int num_threads) {
