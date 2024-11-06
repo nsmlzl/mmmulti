@@ -49,6 +49,9 @@ template <typename Value> class set {
     std::thread writer_thread;
     atomic_queue::AtomicQueue2<Value, 2 << 16> value_queue;
     std::atomic<bool> work_todo;
+
+    bool single_threaded_mode = false;
+    std::ofstream *main_thread_writer = nullptr;
     
 public:
 
@@ -62,9 +65,11 @@ public:
     set(set&& m) = delete;
     set& operator=(set&& m) = delete;
 
-    set(const std::string& f) : filename(f) {
+    set(const std::string& f, const bool single_threaded_mode) : filename(f), single_threaded_mode(single_threaded_mode) {
         work_todo.store(false);
     }
+
+    set(const std::string& f) : set(f, false) {}
 
     ~set(void) {
         close_writer();
@@ -97,18 +102,28 @@ public:
     void open_writer(void) {
         if (!work_todo.load()) {
             work_todo.store(true);
-            writer_thread = std::thread(&set::writer_func, this);
+            if (!single_threaded_mode) {
+                writer_thread = std::thread(&set::writer_func, this);
+            } else {
+                main_thread_writer = new std::ofstream(filename.c_str(), std::ios::binary | std::ios::trunc);
+            }
         }
     }
 
     void close_writer(void) {
         if (work_todo.load()) {
             work_todo.store(false);
-            while (!value_queue.was_empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            if (writer_thread.joinable()) {
-                writer_thread.join();
+            if (!single_threaded_mode) {
+                while (!value_queue.was_empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (writer_thread.joinable()) {
+                    writer_thread.join();
+                }
+            } else {
+                main_thread_writer->close();
+                delete main_thread_writer;
+                main_thread_writer = nullptr;
             }
         }
     }
@@ -134,6 +149,13 @@ public:
     /// open_writer() must be called first to set up our buffer and writer
     void append(const Value& v) {
         value_queue.push(v);
+        // when in single-threaded-mode let main thread write value
+        if (single_threaded_mode) {
+            Value value;
+            while (value_queue.try_pop(value)) {
+                main_thread_writer->write((char*)&value, sizeof(Value));
+            }
+        }
     }
 
     /// return the number of records, which will only work after indexing
